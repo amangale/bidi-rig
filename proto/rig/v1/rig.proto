@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+package rig.v1;
+
+option go_package = "github.com/amangale/bidi-rig/proto/rig/v1";
+
+service Rig {
+  // Bidirectional: client sends sequenced pings, server responds with
+  // echo + the identity of the replica that served it.
+  rpc Session(stream Ping) returns (stream Pong);
+}
+
+message Ping {
+  uint64 seq = 1;         // monotonic per client; gap/duplicate detector
+  bytes payload = 2;      // tunable size for F4 backpressure tests
+}
+
+message Pong {
+  uint64 ack_seq = 1;             // echoes Ping.seq
+  string server_id = 2;           // which replica served this → F1 pinning evidence
+  int64 stream_open_unix_ms = 3;  // when this stream opened → F3 drain analysis
+  uint64 conn_stream_count = 4;   // streams multiplexed on this connection → F1/F2
+}
