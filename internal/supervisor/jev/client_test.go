@@ -13,18 +13,20 @@ import (
 func TestHappyPathMapping(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
+		// Corrected response schema: choice field, confidence, probabilities
 		w.Write([]byte(`{
+			"model": "jev-1.13.0",
 			"answers": {
-				"action": {"value": "force_reconnect", "probability": 0.87, "confidence": 0.87},
-				"is_outage": {"value": true, "probability": 0.92},
-				"severity": {"value": "critical", "probability": 0.78}
+				"action": {"type": "choice", "choice": "force_reconnect", "confidence": 0.87, "probabilities": {"force_reconnect": 0.87, "continue": 0.10, "switch_strategy": 0.02, "abort_run": 0.01}},
+				"is_outage": {"type": "noul", "noul": 0.92},
+				"severity": {"type": "score", "score": 2.0, "confidence": 0.78, "legend": {"0": "healthy", "1": "degraded", "2": "critical", "3": "fatal"}, "probabilities": {"0": 0.05, "1": 0.15, "2": 0.78, "3": 0.02}}
 			}
 		}`))
 	}))
 	defer server.Close()
 
 	breaker := supervisor.NewBreaker(supervisor.DefaultBreakerConfig)
-	client := NewClient("fake-key", server.URL, breaker, 5*time.Second)
+	client := NewClient("fake-key", server.URL, "jev-1.13.0", breaker, 5*time.Second)
 
 	snap := supervisor.Snapshot{
 		RunID:          "test-run",
@@ -60,7 +62,7 @@ func TestCircuitBreakerIntegration(t *testing.T) {
 		ResetTimeout:     100 * time.Millisecond,
 		ProbeSuccesses:   1,
 	})
-	client := NewClient("fake-key", server.URL, breaker, 5*time.Second)
+	client := NewClient("fake-key", server.URL, "latest", breaker, 5*time.Second)
 
 	// Trigger failures until circuit opens
 	for i := 0; i < 3; i++ {
@@ -88,7 +90,7 @@ func TestValidActionsOnly(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient("fake-key", server.URL, supervisor.NewBreaker(supervisor.DefaultBreakerConfig), 5*time.Second)
+	client := NewClient("fake-key", server.URL, "latest", supervisor.NewBreaker(supervisor.DefaultBreakerConfig), 5*time.Second)
 
 	_, err := client.Decide(context.Background(), supervisor.Snapshot{})
 	if err == nil {
@@ -103,7 +105,7 @@ func TestMissingAnswers(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient("fake-key", server.URL, supervisor.NewBreaker(supervisor.DefaultBreakerConfig), 5*time.Second)
+	client := NewClient("fake-key", server.URL, "latest", supervisor.NewBreaker(supervisor.DefaultBreakerConfig), 5*time.Second)
 
 	_, err := client.Decide(context.Background(), supervisor.Snapshot{})
 	if err == nil {
@@ -118,7 +120,7 @@ func TestTimeoutHandling(t *testing.T) {
 	defer server.Close()
 
 	breaker := supervisor.NewBreaker(supervisor.DefaultBreakerConfig)
-	client := NewClient("fake-key", server.URL, breaker, 50*time.Millisecond) // Short timeout
+	client := NewClient("fake-key", server.URL, "latest", breaker, 50*time.Millisecond) // Short timeout
 
 	_, err := client.Decide(context.Background(), supervisor.Snapshot{})
 	if err == nil {

@@ -77,6 +77,7 @@ func (b *reconnectBroadcaster) wait() <-chan struct{} {
 var errForcedReconnect = errors.New("forced reconnect by supervisor")
 
 func main() {
+	const jevVersion = "jev-1.13.0"
 	var (
 		target   = flag.String("target", "localhost:50051", "server target")
 		n        = flag.Int("clients", 10, "number of simulated clients")
@@ -136,7 +137,7 @@ func main() {
 			if apiKey == "" {
 				log.Fatal("TYPESAFE_API_KEY environment variable not set")
 			}
-			sup = jev.NewClient(apiKey, os.Getenv("JEV_BASE_URL"), breaker, 5*time.Second)
+			sup = jev.NewClient(apiKey, os.Getenv("JEV_BASE_URL"), "jev-1.13.0", breaker, 5*time.Second)
 		}
 
 		ctrlCh := make(chan supervisor.Decision, 10)

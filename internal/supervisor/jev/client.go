@@ -16,36 +16,53 @@ type Client struct {
 	httpClient *http.Client
 	apiKey     string
 	baseURL    string
+	model      string // pinned version (e.g., "jev-1.13.0")
 	breaker    *supervisor.Breaker
 	timeout    time.Duration
 }
 
 // NewClient creates a Jev-supervisor client with circuit breaker integration
-func NewClient(apiKey, baseURL string, breaker *supervisor.Breaker, timeout time.Duration) *Client {
+func NewClient(apiKey, baseURL string, model string, breaker *supervisor.Breaker, timeout time.Duration) *Client {
 	if baseURL == "" {
 		baseURL = "https://api.typesafe.ai/v1/systemone"
+	}
+	if model == "" {
+		model = "jev-1.13.0" // pinned to avoid silent drift from "jev-latest"
 	}
 	if timeout == 0 {
 		timeout = 5 * time.Second
 	}
 
 	return &Client{
-		httpClient: &http.Client{
-			Timeout: timeout,
-		},
-		apiKey:  apiKey,
-		baseURL: baseURL,
-		breaker: breaker,
-		timeout: timeout,
+		httpClient: &http.Client{Timeout: timeout},
+		apiKey:     apiKey,
+		baseURL:    baseURL,
+		model:      model,
+		breaker:    breaker,
+		timeout:    timeout,
 	}
 }
 
-// Questions defines the Jev question schema
+// Question is one typed question. Criteria is polymorphic per type.
 type Question struct {
-	Type         string   `json:"type"`
-	Instructions string   `json:"instructions"`
-	Choices      []string `json:"choices,omitempty"`
-	Scale        []string `json:"scale,omitempty"`
+	Type         string          `json:"type"`
+	Instructions string          `json:"instructions"`
+	Criteria     json.RawMessage `json:"criteria,omitempty"`
+}
+
+// Question constructors keep call sites type-safe
+func ChoiceQuestion(instructions string, options map[string]string) Question {
+	c, _ := json.Marshal(options)
+	return Question{Type: "choice", Instructions: instructions, Criteria: c}
+}
+
+func ScoreQuestion(instructions string, levels []string) Question {
+	c, _ := json.Marshal(levels)
+	return Question{Type: "score", Instructions: instructions, Criteria: c}
+}
+
+func NoulQuestion(instructions string) Question {
+	return Question{Type: "noul", Instructions: instructions}
 }
 
 // Request is the Jev systemone API payload
@@ -57,18 +74,26 @@ type Request struct {
 
 // Response is the Jev systemone API response
 type Response struct {
+	Model   string            `json:"model"`
 	Answers map[string]Answer `json:"answers"`
+	Usage   struct {
+		InputTokens  int `json:"input_tokens"`
+		OutputTokens int `json:"output_tokens"`
+	} `json:"usage"`
 }
 
 type Answer struct {
-	Value       interface{} `json:"value"`
-	Probability float64     `json:"probability"`
-	Confidence  float64     `json:"confidence,omitempty"`
+	Type          string             `json:"type"`
+	Choice        string             `json:"choice,omitempty"`
+	Noul          float64            `json:"noul,omitempty"`
+	Score         float64            `json:"score,omitempty"`
+	Confidence    float64            `json:"confidence,omitempty"`
+	Probabilities map[string]float64 `json:"probabilities,omitempty"`
+	Legend        map[string]string  `json:"legend,omitempty"`
 }
 
 // Decide calls Jev with the current snapshot and returns a Decision
 func (c *Client) Decide(ctx context.Context, snap supervisor.Snapshot) (supervisor.Decision, error) {
-	// Circuit breaker check — if open, caller will fall back to heuristic
 	if !c.breaker.Ready() {
 		return supervisor.Decision{}, supervisor.ErrCircuitOpen
 	}
@@ -82,27 +107,23 @@ func (c *Client) Decide(ctx context.Context, snap supervisor.Snapshot) (supervis
 		return supervisor.Decision{}, fmt.Errorf("serialize state: %w", err)
 	}
 
-	// Define questions — these define your decision space
 	req := Request{
-		Model: "jev-latest",
+		Model: c.model,
 		State: string(stateJSON),
 		Questions: map[string]Question{
-			"action": {
-				Type:         "choice",
-				Instructions: "Given this gRPC streaming run state under partial outage, choose the NEXT supervisory action. Options: continue (keep running), switch_strategy (change delivery semantics), force_reconnect (re-establish stream immediately), abort_run (stop this test run).",
-				Choices: []string{
-					"continue", "switch_strategy", "force_reconnect", "abort_run",
-				},
-			},
-			"is_outage": {
-				Type:         "boolean",
-				Instructions: "Do these symptoms indicate a sustained outage rather than transient network noise?",
-			},
-			"severity": {
-				Type:         "score",
-				Instructions: "Rate severity of degradation. Scale: healthy (good throughput), degraded (minor issues), critical (significant failures), fatal (unrecoverable).",
-				Scale:        []string{"healthy", "degraded", "critical", "fatal"},
-			},
+			"action": ChoiceQuestion(
+				"Given this gRPC streaming run state under partial outage, choose the NEXT supervisory action.",
+				map[string]string{
+					"continue":        "Keep running the current strategy; state looks acceptable",
+					"switch_strategy": "Change delivery semantics (flip raw/jittered backoff behavior)",
+					"force_reconnect": "Kill all client streams and reconnect immediately",
+					"abort_run":       "Terminate this test run",
+				}),
+			"is_outage": NoulQuestion(
+				"Do these symptoms indicate a sustained outage rather than transient network noise?"),
+			"severity": ScoreQuestion(
+				"Rate severity of degradation.",
+				[]string{"healthy", "degraded", "critical", "fatal"}),
 		},
 	}
 
@@ -130,7 +151,9 @@ func (c *Client) Decide(ctx context.Context, snap supervisor.Snapshot) (supervis
 
 	if resp.StatusCode >= 400 {
 		c.breaker.RecordFailure()
-		return supervisor.Decision{}, fmt.Errorf("Jev API error %d", resp.StatusCode)
+		body := make([]byte, 1024)
+		n, _ := resp.Body.Read(body)
+		return supervisor.Decision{}, fmt.Errorf("Jev API error %d: %s", resp.StatusCode, string(body[:n]))
 	}
 
 	var jevResp Response
@@ -144,25 +167,23 @@ func (c *Client) Decide(ctx context.Context, snap supervisor.Snapshot) (supervis
 }
 
 func (c *Client) mapToDecision(resp Response, start time.Time) (supervisor.Decision, error) {
-	actionVal, ok := resp.Answers["action"]
+	actionAns, ok := resp.Answers["action"]
 	if !ok {
 		return supervisor.Decision{}, fmt.Errorf("missing action answer")
 	}
 
-	actionStr, ok := actionVal.Value.(string)
-	if !ok {
-		return supervisor.Decision{}, fmt.Errorf("action value not string: %T", actionVal.Value)
+	if actionAns.Choice == "" {
+		return supervisor.Decision{}, fmt.Errorf("empty choice value in action answer")
 	}
 
-	action, err := parseAction(actionStr)
+	action, err := parseAction(actionAns.Choice)
 	if err != nil {
 		return supervisor.Decision{}, err
 	}
 
-	confidence := actionVal.Confidence
+	confidence := actionAns.Confidence
 	if confidence == 0 {
-		// Fallback: derive from probability (some versions use probability field)
-		confidence = actionVal.Probability
+		confidence = 1.0 // fallback if confidence missing
 	}
 
 	return supervisor.Decision{
@@ -170,7 +191,11 @@ func (c *Client) mapToDecision(resp Response, start time.Time) (supervisor.Decis
 		Confidence: confidence,
 		Source:     "jev",
 		LatencyMs:  int64(time.Since(start).Milliseconds()),
-		Raw:        c.extractProbabilities(resp),
+		Raw: map[string]float64{
+			"choice_confidence": confidence,
+			"noul":              resp.Answers["is_outage"].Noul,
+			"score":             resp.Answers["severity"].Score,
+		},
 	}, nil
 }
 
@@ -181,17 +206,4 @@ func parseAction(s string) (supervisor.Action, error) {
 	default:
 		return supervisor.ActionContinue, fmt.Errorf("unknown action %q", s)
 	}
-}
-
-func (c *Client) extractProbabilities(resp Response) map[string]float64 {
-	probs := make(map[string]float64)
-	for k, a := range resp.Answers {
-		if a.Probability > 0 {
-			probs[k] = a.Probability
-		}
-		if a.Confidence > 0 {
-			probs[k+"_conf"] = a.Confidence
-		}
-	}
-	return probs
 }
